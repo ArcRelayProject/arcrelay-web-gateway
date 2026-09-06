@@ -1,0 +1,31 @@
+[package]
+name = "arcrelay-web-gateway"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+publish = false
+
+[dependencies]
+ts-rs = { version = "12", features = ["serde-json-impl", "chrono-impl", "uuid-impl", "no-serde-warnings"] }
+arcrelay-files = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-files.git", rev = "a1ecfd3ba798b3fee97ec298289363850af5b702" }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query"] }
+futures-util = "0.3"
+httpdate = "1"
+libc = "0.2"
+local-ip-address = "0.6"
+mime_guess = "2"
+percent-encoding = "2"
+rand = "0.8"
+rust-embed = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+socket2 = "0.6"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = "0.1"
+thiserror = "2"
+
+[dev-dependencies]
+http-body-util = "0.1"
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
