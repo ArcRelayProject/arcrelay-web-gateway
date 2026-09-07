@@ -7,7 +7,7 @@ publish = false
 
 [dependencies]
 ts-rs = { version = "12", features = ["serde-json-impl", "chrono-impl", "uuid-impl", "no-serde-warnings"] }
-arcrelay-files = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-files.git", rev = "6e3a8d27476b14e04b407c9033be18c78465b0aa" }
+arcrelay-files = { version = "0.1.0", git = "https://github.com/ArcRelayProject/arcrelay-files.git", rev = "b9e94d7eb91a5c6ca3995783759e96241b5b00dc" }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query"] }
 futures-util = "0.3"
 httpdate = "1"
