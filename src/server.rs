@@ -26,8 +26,8 @@ use crate::WebGatewaySettings;
 
 const SESSION_COOKIE: &str = "arcrelay_web_session";
 const MAX_FAILED_ATTEMPTS_PER_MINUTE: usize = 5;
-const MAX_CONCURRENT_STREAMS: usize = 16;
-const MAX_CONCURRENT_STREAMS_PER_IP: usize = 4;
+const MAX_AUTH_CLIENTS: usize = 4096;
+const AUTH_WINDOW: Duration = Duration::from_secs(60);
 type FailedAuthAttempts = Arc<Mutex<HashMap<(IpAddr, String), VecDeque<Instant>>>>;
 
 #[derive(Clone)]
@@ -37,8 +37,7 @@ pub(crate) struct GatewayState {
     pub settings: Arc<WebGatewaySettings>,
     app_version: Arc<str>,
     failed_auth: FailedAuthAttempts,
-    stream_limit: Arc<tokio::sync::Semaphore>,
-    per_ip_stream_limits: Arc<Mutex<HashMap<IpAddr, Arc<tokio::sync::Semaphore>>>>,
+    admission: Arc<crate::admission::StreamAdmission>,
 }
 
 impl GatewayState {
@@ -54,8 +53,7 @@ impl GatewayState {
             settings: Arc::new(settings),
             app_version,
             failed_auth: Arc::new(Mutex::new(HashMap::new())),
-            stream_limit: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS)),
-            per_ip_stream_limits: Arc::new(Mutex::new(HashMap::new())),
+            admission: Arc::new(crate::admission::StreamAdmission::default()),
         }
     }
 
@@ -459,22 +457,10 @@ async fn content(
         Response::new(Body::empty())
     } else {
         let permit = state
-            .stream_limit
-            .clone()
-            .acquire_owned()
+            .admission
+            .acquire(peer.ip())
             .await
-            .map_err(ApiError::internal_with)?;
-        let ip_limit = state
-            .per_ip_stream_limits
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .entry(peer.ip())
-            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_STREAMS_PER_IP)))
-            .clone();
-        let ip_permit = ip_limit
-            .acquire_owned()
-            .await
-            .map_err(ApiError::internal_with)?;
+            .map_err(|message| ApiError::new(StatusCode::TOO_MANY_REQUESTS, message))?;
         let mut file = open_no_follow(&prepared.path)
             .await
             .map_err(|_| ApiError::not_found())?;
@@ -482,16 +468,9 @@ async fn content(
             .await
             .map_err(ApiError::internal_with)?;
         let stream = futures_util::stream::unfold(
-            (
-                ReaderStream::new(file.take(content_length)),
-                permit,
-                ip_permit,
-            ),
-            |(mut stream, permit, ip_permit)| async move {
-                stream
-                    .next()
-                    .await
-                    .map(|item| (item, (stream, permit, ip_permit)))
+            (ReaderStream::new(file.take(content_length)), permit),
+            |(mut stream, permit)| async move {
+                stream.next().await.map(|item| (item, (stream, permit)))
             },
         );
         let body = Body::from_stream(stream);
@@ -549,7 +528,11 @@ async fn open_no_follow(path: &std::path::Path) -> std::io::Result<tokio::fs::Fi
         use std::os::unix::fs::OpenOptionsExt as _;
         let mut options = std::fs::OpenOptions::new();
         options.read(true).custom_flags(libc::O_NOFOLLOW);
-        options.open(path).map(tokio::fs::File::from_std)
+        let path = path.to_owned();
+        tokio::task::spawn_blocking(move || options.open(path))
+            .await
+            .map_err(std::io::Error::other)?
+            .map(tokio::fs::File::from_std)
     }
     #[cfg(not(unix))]
     {
@@ -676,24 +659,39 @@ fn auth_rate_limited(state: &GatewayState, ip: IpAddr, slug: &str) -> bool {
         .failed_auth
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let values = failures.entry((ip, slug.to_string())).or_default();
-    while values
-        .front()
-        .is_some_and(|attempt| now.duration_since(*attempt) >= Duration::from_secs(60))
-    {
-        values.pop_front();
-    }
-    values.len() >= MAX_FAILED_ATTEMPTS_PER_MINUTE
+    prune_auth_failures(&mut failures, now);
+    failures
+        .get(&(ip, slug.to_string()))
+        .is_some_and(|values| values.len() >= MAX_FAILED_ATTEMPTS_PER_MINUTE)
+        || (!failures.contains_key(&(ip, slug.to_string())) && failures.len() >= MAX_AUTH_CLIENTS)
+}
+
+fn prune_auth_failures(failures: &mut HashMap<(IpAddr, String), VecDeque<Instant>>, now: Instant) {
+    failures.retain(|_, values| {
+        while values
+            .front()
+            .is_some_and(|attempt| now.duration_since(*attempt) >= AUTH_WINDOW)
+        {
+            values.pop_front();
+        }
+        !values.is_empty()
+    });
 }
 
 fn record_auth_failure(state: &GatewayState, ip: IpAddr, slug: &str) {
-    state
+    let mut failures = state
         .failed_auth
         .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .entry((ip, slug.to_string()))
-        .or_default()
-        .push_back(Instant::now());
+        .unwrap_or_else(|error| error.into_inner());
+    let now = Instant::now();
+    prune_auth_failures(&mut failures, now);
+    if failures.len() >= MAX_AUTH_CLIENTS && !failures.contains_key(&(ip, slug.to_string())) {
+        return;
+    }
+    let values = failures.entry((ip, slug.to_string())).or_default();
+    if values.len() < MAX_FAILED_ATTEMPTS_PER_MINUTE {
+        values.push_back(now);
+    }
 }
 
 fn clear_auth_failures(state: &GatewayState, ip: IpAddr, slug: &str) {
@@ -909,6 +907,49 @@ mod tests {
             record_auth_failure(&state, ip, "share-id");
         }
         assert!(auth_rate_limited(&state, ip, "share-id"));
+    }
+
+    #[test]
+    fn authentication_state_expires_and_cannot_grow_without_bound() {
+        let config = tempfile::tempdir().unwrap();
+        let state = GatewayState::new(
+            FileShareService::load(config.path()).unwrap(),
+            Arc::new(SessionStore::default()),
+            WebGatewaySettings::default(),
+            Arc::<str>::from("test"),
+        );
+        let ip = "192.168.1.20".parse().unwrap();
+        {
+            let mut failures = state.failed_auth.lock().unwrap();
+            for index in 0..MAX_AUTH_CLIENTS {
+                failures.insert((ip, index.to_string()), VecDeque::from([Instant::now()]));
+            }
+        }
+        assert!(auth_rate_limited(&state, ip, "new-share"));
+        record_auth_failure(&state, ip, "new-share");
+        assert_eq!(state.failed_auth.lock().unwrap().len(), MAX_AUTH_CLIENTS);
+        {
+            let mut failures = state.failed_auth.lock().unwrap();
+            for values in failures.values_mut() {
+                values[0] -= AUTH_WINDOW;
+            }
+        }
+        assert!(!auth_rate_limited(&state, ip, "new-share"));
+        assert!(state.failed_auth.lock().unwrap().is_empty());
+        for _ in 0..20 {
+            record_auth_failure(&state, ip, "new-share");
+        }
+        assert_eq!(
+            state
+                .failed_auth
+                .lock()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap()
+                .len(),
+            MAX_FAILED_ATTEMPTS_PER_MINUTE
+        );
     }
 
     fn request(method: Method, uri: &str, host: &str, body: Body) -> Request<Body> {
