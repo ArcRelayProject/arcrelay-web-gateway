@@ -1,6 +1,7 @@
 //! ArcRelay's LAN-only browser gateway. This listener intentionally has no
 //! relationship to the localhost MCP listener or its bearer-token trust model.
 
+mod admission;
 mod assets;
 mod network_guard;
 mod server;

@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 
 use rand::RngCore as _;
 
+const MAX_SESSIONS: usize = 1024;
+
 const ABSOLUTE_SESSION_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Debug)]
@@ -45,6 +47,15 @@ impl SessionStore {
                 }
             }
         }
+        if sessions.len() >= MAX_SESSIONS {
+            if let Some(oldest) = sessions
+                .iter()
+                .min_by_key(|(_, session)| session.last_access_at)
+                .map(|(token, _)| token.clone())
+            {
+                sessions.remove(&oldest);
+            }
+        }
         let token = random_token();
         sessions.insert(
             token.clone(),
@@ -71,7 +82,15 @@ impl SessionStore {
             .sessions
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        prune(&mut sessions, idle_lifetime);
+        let expired = sessions.get(token).is_some_and(|session| {
+            let now = Instant::now();
+            now.duration_since(session.created_at) >= ABSOLUTE_SESSION_LIFETIME
+                || now.duration_since(session.last_access_at) >= idle_lifetime
+        });
+        if expired {
+            sessions.remove(token);
+        }
+
         let Some(session) = sessions.get_mut(token) else {
             return false;
         };
@@ -158,6 +177,56 @@ fn random_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sessions_evict_oldest_and_expired_tokens_cannot_authorize() {
+        let store = SessionStore::default();
+        let ip = "192.168.1.20".parse().unwrap();
+        let lifetime = Duration::from_secs(300);
+        let oldest = store.create_or_authorize(None, ip, "share", 1, lifetime);
+        store
+            .sessions
+            .lock()
+            .unwrap()
+            .get_mut(&oldest)
+            .unwrap()
+            .last_access_at -= Duration::from_secs(1);
+        for _ in 0..MAX_SESSIONS {
+            store.create_or_authorize(None, ip, "share", 1, lifetime);
+        }
+        assert_eq!(store.len(), MAX_SESSIONS);
+        assert!(!store.authorized(Some(&oldest), ip, "share", 1, lifetime));
+        let token = store.create_or_authorize(None, ip, "share", 1, lifetime);
+        store
+            .sessions
+            .lock()
+            .unwrap()
+            .get_mut(&token)
+            .unwrap()
+            .last_access_at -= lifetime;
+        assert!(!store.authorized(Some(&token), ip, "share", 1, lifetime));
+        assert!(!store.sessions.lock().unwrap().contains_key(&token));
+    }
+
+    #[test]
+    fn authorizing_one_session_does_not_scan_or_mutate_other_sessions() {
+        let store = SessionStore::default();
+        let ip = "192.168.1.20".parse().unwrap();
+        let lifetime = Duration::from_secs(300);
+        let expired = store.create_or_authorize(None, ip, "share", 1, lifetime);
+        let current = store.create_or_authorize(None, ip, "share", 1, lifetime);
+        store
+            .sessions
+            .lock()
+            .unwrap()
+            .get_mut(&expired)
+            .unwrap()
+            .last_access_at -= lifetime;
+        assert!(store.authorized(Some(&current), ip, "share", 1, lifetime));
+        assert_eq!(store.len(), 2);
+        store.create_or_authorize(None, ip, "share", 1, lifetime);
+        assert!(!store.sessions.lock().unwrap().contains_key(&expired));
+    }
 
     #[test]
     fn credential_revision_and_source_ip_invalidate_authorization() {
